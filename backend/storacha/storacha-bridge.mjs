@@ -4,12 +4,12 @@
 
 import * as Client from '@storacha/client';
 import * as readline from 'readline';
-import * as path from 'path';
 import * as dagPB from '@ipld/dag-pb';
 import { UnixFS } from 'ipfs-unixfs';
 import { CID } from 'multiformats/cid';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { CarWriter } from '@ipld/car';
+import * as Name from 'w3name'
 
 let client = null;
 let currentSpace = null;
@@ -22,7 +22,7 @@ const rl = readline.createInterface({
 });
 
 // Handler functions
-const handlers = {
+export const handlers = {
   async init({ spaceDID, email }) {
     try {
       // Create client
@@ -61,8 +61,6 @@ const handlers = {
           }
         }
         
-        // Load metadata for this space
-        loadMetadata(spaceDID);
       }
       
       return { initialized: true, spaceDID: currentSpace?.did() };
@@ -98,8 +96,11 @@ const handlers = {
     });
     
     const rootCid = await client.uploadDirectory(fileObjects);
-    
-    return { cid: rootCid.toString() };
+    const ipnsName = await Name.create()
+    const value = '/ipfs/' + rootCid.toString()
+    const revision = await Name.v0(ipnsName , value)
+    await Name.publish(revision , ipnsName.key)
+    return { cid: rootCid.toString(), name: ipnsName.toString() };
   },
   
   async list({ path: dirPath }) {
@@ -255,57 +256,19 @@ const handlers = {
     return { cid: cid };
   },
 
-  // ========================================
-  // Content Mutation Operations
-  // ========================================
-
-  async fetchBlock({ cid }) {
-    if (!client) throw new Error('Client not initialized');
-    
-    try {
-      const res = await fetch(
-        `https://ipfs.io/ipfs/${cid}?format=raw`,
-        {
-          headers: {
-            'Accept': 'application/vnd.ipld.raw'
-          }
+  async fetchBlock(cid) {
+    const res = await fetch(
+      `https://ipfs.io/ipfs/${cid}?format=raw`,
+      {
+        headers: {
+          'Accept': 'application/vnd.ipld.raw'
         }
-      );
-      
-      if (!res.ok) throw new Error(`Failed fetching block: ${res.status}`);
-      
-      const arrayBuffer = await res.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-      
-      // Decode the DAG-PB node
-      const node = dagPB.decode(bytes);
-      
-      const links = node.Links.map(l => ({
-        name: l.Name,
-        hash: l.Hash.toString(),
-        size: l.Tsize || 0
-      }));
-      
-      // Check if this is a directory by examining UnixFS data
-      let isDir = false;
-      try {
-        const unixfs = UnixFS.unmarshal(node.Data);
-        isDir = unixfs.type === 'directory';
-      } catch (e) {
-        // Not a UnixFS node, assume directory if has links
-        isDir = links.length > 0;
       }
-      
-      return {
-        cid: cid.toString(),
-        data: node.Data,
-        links: links,
-        isDir: isDir,
-        rawBytes: Buffer.from(bytes).toString('base64')
-      };
-    } catch (error) {
-      throw new Error(`Failed to fetch block ${cid}: ${error.message}`);
-    }
+    )
+    if (!res.ok) throw new Error(`Failed fetching block: ${res.status}`)
+    
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    return bytes
   },
 
   async createFileBlock({ content }) {
@@ -340,33 +303,215 @@ const handlers = {
     }
   },
 
-  async rebuildDirNode({ oldData, links }) {
+  async createEmptyDirectoryBlock() {
     try {
-      const linksArray = links.map(l => ({
-        Name: l.name,
-        Hash: CID.parse(l.hash),
-        Tsize: l.size || 0
-      }));
-      
-      const node = dagPB.prepare({
-        Data: oldData instanceof Uint8Array ? oldData : Buffer.from(oldData, 'base64'),
-        Links: linksArray
+      const unixfs = new UnixFS({
+        type: 'directory'
       });
-      
+
+      const node = dagPB.prepare({
+        Data: unixfs.marshal(),
+        Links: []
+      });
+
       const bytes = dagPB.encode(node);
+
       const hash = await sha256.digest(bytes);
       const cid = CID.create(1, dagPB.code, hash);
-      
+
       return {
-        cid: cid.toString(),
-        data: node.Data,
-        links: links,
+        cid: cid,       // CID object
         isDir: true,
-        rawBytes: Buffer.from(bytes).toString('base64')
+        links: [],
+        bytes: Buffer.from(bytes)  // Buffer
       };
+
     } catch (error) {
-      throw new Error(`Failed to rebuild directory node: ${error.message}`);
+      throw new Error(`Failed to create empty directory: ${error.message}`);
     }
+  },
+
+  /**
+   * Rebuild a dag-pb directory node, either updating an existing link or
+   * adding a new one if no link with that name exists yet.
+   *
+   * @param {dagPB.PBNode} oldNode  - the decoded dag-pb node to update
+   * @param {{ name: string, cid: CID, size: number }} updatedLink
+   * @returns {{ cid: CID, bytes: Buffer }}
+   */
+  async rebuildDirNode(oldNode, updatedLink) {
+    let found = false;
+
+    const links = oldNode.Links.map(l => {
+      if (l.Name === updatedLink.name) {
+        found = true;
+        return {
+          Name: l.Name,
+          Tsize: updatedLink.size,
+          Hash: updatedLink.cid   // must be a CID object
+        };
+      }
+      return l;
+    });
+
+    // If the link didn't exist yet, append it
+    if (!found) {
+      links.push({
+        Name: updatedLink.name,
+        Tsize: updatedLink.size,
+        Hash: updatedLink.cid
+      });
+    }
+
+    // dag-pb requires links sorted by name
+    links.sort((a, b) => {
+      if (a.Name < b.Name) return -1;
+      if (a.Name > b.Name) return 1;
+      return 0;
+    });
+
+    const node = dagPB.prepare({
+      Data: oldNode.Data,
+      Links: links
+    });
+
+    const bytes = dagPB.encode(node);
+    const hash = await sha256.digest(bytes);
+    const cid = CID.create(1, dagPB.code, hash);
+
+    return { cid, bytes: Buffer.from(bytes) };
+  },
+
+  async fetchDag(cid) {
+    console.error(`Fetching DAG node for CID ${cid}...`);
+    const bytes = await handlers.fetchBlock(cid);
+    const node = dagPB.decode(bytes);
+    console.error(`node ${cid} has ${node.Links.length} links and data size ${node.Data?.length ?? 0} bytes`);
+    return node;
+  },
+
+  async mkdir({ cid, path, name }) {
+    if (!client) throw new Error('Client not initialized');
+    if (!currentSpace) throw new Error('No space selected');
+
+    // ── 1. Locate the original upload record ──────────────────────────────
+    const uploads = await client.capability.upload.list();
+    console.error(`Looking for original upload with root CID ${cid} among ${uploads.results.length} uploads...`);
+
+    const originalUpload = uploads.results.find(u => u.root.toString() === cid.toString());
+    if (!originalUpload) {
+      throw new Error(`Original upload with root ${cid} not found in your space.`);
+    }
+
+    const originalRootCID = CID.parse(cid);
+
+    // ── 2. Walk the path to the target parent node ────────────────────────
+    const pathParts = (path === '' || path === '/')
+      ? []
+      : path.split('/').filter(Boolean);
+
+    const stack = []; // [{name, node}] breadcrumb trail from root down
+    let currentNode = await handlers.fetchDag(cid);
+
+    for (const part of pathParts) {
+      const link = currentNode.Links.find(l => l.Name === part);
+      if (!link) {
+        throw new Error(`Subdir "${part}" not found under current node`);
+      }
+      stack.push({ name: part, node: currentNode });
+      currentNode = await handlers.fetchDag(link.Hash.toString());
+    }
+
+    // ── 3. Create the new empty directory block ───────────────────────────
+    const newDir = await handlers.createEmptyDirectoryBlock();
+
+    // ── 4. Inject the new directory entry into the target parent ──────────
+    let updated = await handlers.rebuildDirNode(currentNode, {
+      name,
+      cid: newDir.cid,
+      size: newDir.bytes.length
+    });
+
+    // Collect all new/modified blocks (innermost first, root last)
+    const blocksToWrite = [
+      { cid: newDir.cid,   bytes: newDir.bytes   },
+      { cid: updated.cid,  bytes: updated.bytes  }
+    ];
+
+    // ── 5. Bubble changes up the ancestor chain ───────────────────────────
+    while (stack.length > 0) {
+      const parent = stack.pop();
+      updated = await handlers.rebuildDirNode(parent.node, {
+        name: parent.name,      // the child's link name inside the parent
+        cid: updated.cid,
+        size: updated.bytes.length
+      });
+      blocksToWrite.push({ cid: updated.cid, bytes: updated.bytes });
+    }
+
+    const newRootCID = updated.cid;
+    console.error(`New root CID: ${newRootCID}`);
+
+    // ── 6. Build and upload a CAR containing only the changed blocks ──────
+    const { writer, out } = await CarWriter.create([newRootCID]);
+    const chunks = [];
+
+    const readerPromise = (async () => {
+      for await (const chunk of out) {
+        chunks.push(chunk);
+      }
+    })();
+
+    for (const block of blocksToWrite) {
+      // Ensure cid is always a CID object
+      const cidObj = typeof block.cid === 'string' ? CID.parse(block.cid) : block.cid;
+      await writer.put({ cid: cidObj, bytes: block.bytes });
+    }
+
+    await writer.close();
+    await readerPromise;
+
+    const carBytes = Buffer.concat(chunks);
+    console.error(`Uploading CAR (${carBytes.length} bytes)...`);
+
+    const carBlob = new Blob([carBytes], { type: 'application/car' });
+    let newShardCID;
+
+    await client.uploadCAR(carBlob, {
+      rootCID: newRootCID,
+      onShardStored: meta => {
+        newShardCID = meta.cid;
+        console.error(`New shard CID: ${newShardCID}`);
+      }
+    });
+
+    if (!newShardCID) {
+      throw new Error('Failed to get shard CID from CAR upload');
+    }
+
+    // ── 7. Register the NEW root with OLD shards + NEW shard ─────────────
+    //
+    // The original shards still hold all the underlying file data blocks.
+    // The new CAR shard holds only the changed dag-pb directory nodes.
+    // Both are needed to fully reconstruct the new tree.
+    //
+    // Normalise every shard to a CID object — the list API can return plain
+    // CID objects, {cid} wrappers, or strings depending on the SDK version.
+    const normaliseCID = (s) => {
+      if (s && s.constructor?.name === 'CID') return s;
+      if (s && s.cid) return typeof s.cid === 'string' ? CID.parse(s.cid) : s.cid;
+      if (typeof s === 'string') return CID.parse(s);
+      return CID.parse(s.toString());
+    };
+
+    const allShards = [
+      ...originalUpload.shards.map(normaliseCID),
+      normaliseCID(newShardCID)
+    ];
+    await client.capability.upload.add(newRootCID, allShards);
+    console.error(`Registered new root ${newRootCID} with ${allShards.length} shards (${originalUpload.shards.length} original + 1 new)`);
+
+    return { newRootCID: newRootCID.toString() };
   },
 
   async createCAR({ rootCID, blocks }) {
@@ -432,28 +577,40 @@ const handlers = {
   async getUploads({ rootCID }) {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
-    
+
+    // Normalise rootCID — accept both string and CID object
+    const targetStr = rootCID.toString();
+
     try {
-      const targetRootCID = CID.parse(rootCID);
       const uploads = [];
-      
+
       let cursor;
       do {
         const res = await client.capability.upload.list({ cursor });
         if (!res || !res.results) break;
-        
+
         for (const upload of res.results) {
-          if (upload.root.toString() === targetRootCID.toString()) {
-            uploads.push({
-              cid: upload.root.toString(),
-              root: upload.root.toString(),
-              shards: (upload.shards || []).map(s => s.cid.toString()),
-              size: upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0,
-              time: upload.insertedAt || new Date().toISOString()
-            });
-          }
+          if (upload.root.toString() !== targetStr) continue;
+
+          // Storacha shard entries can be plain CID objects, {cid} wrappers,
+          // or IPLD link objects ({'/': '...'}). Normalise all forms.
+          const shardCIDs = (upload.shards || []).map(s => {
+            if (typeof s === 'string') return s;
+            if (s && typeof s.toString === 'function' && s.constructor?.name === 'CID') return s.toString();
+            if (s && s.cid) return s.cid.toString();
+            // fallback — call toString() and hope for the best
+            return s.toString();
+          });
+
+          uploads.push({
+            cid:    upload.root.toString(),
+            root:   upload.root.toString(),
+            shards: shardCIDs,
+            size:   upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0,
+            time:   upload.insertedAt || new Date().toISOString()
+          });
         }
-        
+
         cursor = res.cursor;
       } while (cursor);
       
@@ -513,8 +670,6 @@ const handlers = {
   }
 
 };
-
-  
 
 // Process incoming requests
 rl.on('line', async (line) => {
