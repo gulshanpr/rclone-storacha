@@ -9,10 +9,84 @@ import { UnixFS } from 'ipfs-unixfs';
 import { CID } from 'multiformats/cid';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { CarWriter } from '@ipld/car';
-import * as Name from 'w3name'
+import * as Name from 'w3name';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 let client = null;
 let currentSpace = null;
+
+// W3name registry to track IPNS names by CID
+// Format: { "cid": { name: Name, ipnsName: string, keyFile: string } }
+const nameRegistry = new Map();
+
+// Directory to store w3name keys
+const W3NAME_DIR = path.join(os.homedir(), '.storacha-rclone', 'w3name-keys');
+
+// Ensure key storage directory exists
+async function ensureKeyDir() {
+  try {
+    await fs.promises.mkdir(W3NAME_DIR, { recursive: true });
+  } catch (error) {
+    console.error(`[w3name] Warning: Could not create key directory: ${error.message}`);
+  }
+}
+
+// Save a w3name key to disk
+async function saveNameKey(cid, name) {
+  try {
+    await ensureKeyDir();
+    const keyFile = path.join(W3NAME_DIR, `${cid}.key`);
+    await fs.promises.writeFile(keyFile, name.key.bytes);
+    console.error(`[w3name] Saved key for CID ${cid} to ${keyFile}`);
+    return keyFile;
+  } catch (error) {
+    console.error(`[w3name] Error saving key: ${error.message}`);
+    return null;
+  }
+}
+
+// Load a w3name key from disk
+async function loadNameKey(cid) {
+  try {
+    const keyFile = path.join(W3NAME_DIR, `${cid}.key`);
+    const bytes = await fs.promises.readFile(keyFile);
+    const name = await Name.from(bytes);
+    console.error(`[w3name] Loaded key for CID ${cid} from ${keyFile}`);
+    return { name, keyFile };
+  } catch (error) {
+    // Don't log error - it's normal for keys to not exist
+    return null;
+  }
+}
+
+// Load all existing keys on startup
+async function loadAllKeys() {
+  try {
+    await ensureKeyDir();
+    const files = await fs.promises.readdir(W3NAME_DIR);
+    
+    for (const file of files) {
+      if (file.endsWith('.key')) {
+        const cid = file.replace('.key', '');
+        const result = await loadNameKey(cid);
+        if (result) {
+          nameRegistry.set(cid, {
+            name: result.name,
+            ipnsName: result.name.toString(),
+            keyFile: result.keyFile
+          });
+        }
+      }
+    }
+    if (nameRegistry.size > 0) {
+      console.error(`[w3name] Loaded ${nameRegistry.size} keys from ${W3NAME_DIR}`);
+    }
+  } catch (error) {
+    console.error(`[w3name] Error loading keys: ${error.message}`);
+  }
+}
 
 // Read JSON requests from stdin, write JSON responses to stdout
 const rl = readline.createInterface({
@@ -29,7 +103,7 @@ export const handlers = {
       client = await Client.create();
       
       // Login if email provided and not already logged in
-      if (email) {
+      if (email && typeof email === 'string' && email.trim() !== '') {
         const accounts = client.accounts();
         if (Object.keys(accounts).length === 0) {
           console.error(`[storacha] Logging in with email: ${email}`);
@@ -38,32 +112,16 @@ export const handlers = {
         }
       }
       
-      // Set space if provided
-      if (spaceDID) {
-        const spaces = client.spaces();
-        currentSpace = spaces.find(s => s.did() === spaceDID);
-        
-        if (currentSpace) {
-          await client.setCurrentSpace(spaceDID);
-        } else {
-          // Space not found, might need to claim delegations
-          console.error(`[storacha] Space ${spaceDID} not found locally, claiming delegations...`);
-          await client.capability.access.claim();
-          
-          // Try again
-          const updatedSpaces = client.spaces();
-          currentSpace = updatedSpaces.find(s => s.did() === spaceDID);
-          
-          if (currentSpace) {
-            await client.setCurrentSpace(spaceDID);
-          } else {
-            throw new Error(`Space ${spaceDID} not found. Available spaces: ${updatedSpaces.map(s => s.did()).join(', ')}`);
-          }
-        }
-        
-      }
+      currentSpace = await client.createSpace('rclone-space');
+      const newSpaceDID = spaceDID;
       
-      return { initialized: true, spaceDID: currentSpace?.did() };
+      // Set it as the current space
+      await client.setCurrentSpace(newSpaceDID);
+      
+      // Load existing w3name keys from disk
+      await loadAllKeys();
+      
+      return { initialized: true, spaceDID: newSpaceDID };
     } catch (error) {
       throw new Error(`Init failed: ${error.message}`);
     }
@@ -96,11 +154,25 @@ export const handlers = {
     });
     
     const rootCid = await client.uploadDirectory(fileObjects);
-    const ipnsName = await Name.create()
-    const value = '/ipfs/' + rootCid.toString()
-    const revision = await Name.v0(ipnsName , value)
-    await Name.publish(revision , ipnsName.key)
-    return { cid: rootCid.toString(), name: ipnsName.toString() };
+    const cidStr = rootCid.toString();
+    
+    // Create new w3name for this CID and save it
+    const name = await Name.create();
+    const ipnsName = name.toString();
+    const revision = await Name.v0(name, rootCid);
+    await Name.publish(revision, name.key);
+    
+    // Save to registry and disk
+    const keyFile = await saveNameKey(cidStr, name);
+    nameRegistry.set(cidStr, {
+      name: name,
+      ipnsName: ipnsName,
+      keyFile: keyFile
+    });
+    
+    console.error(`[w3name] Created and published ${ipnsName} for CID ${cidStr}`);
+    
+    return { cid: cidStr, name: ipnsName };
   },
   
   async list({ path: dirPath }) {
@@ -109,106 +181,243 @@ export const handlers = {
     
     console.error(`[storacha] list called with path: "${dirPath}"`);
     
-    const entries = [];
-    let foundExactMatch = false;
-    
     try {
-      // Use client.capability.upload.list() with cursor pagination
-      let cursor;
-      do {
-        const res = await client.capability.upload.list({ cursor });
-        if (!res || !res.results) break;
-        
-        for (const upload of res.results) {
-          const rootCID = upload.root.toString();
-          const size = upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0;
-          
-          // Use root CID as the name since we don't have filename mapping
-          // If dirPath is specified, only return exact match or items in that directory
-          if (dirPath) {
-            // Exact match - return only this CID
-            if (rootCID === dirPath || rootCID === dirPath.replace(/\/$/, '')) {
-              entries.push({
-                name: rootCID,
-                cid: rootCID,
-                size: size,
-                isDir: false,
-                modTime: upload.insertedAt || new Date().toISOString()
-              });
-              // Found exact match, stop all searching
-              foundExactMatch = true;
-              break;
-            }
-            // Prefix match for directory listing (only if path ends with /)
-            if (dirPath.endsWith('/')) {
-              const prefix = dirPath;
-              if (rootCID.startsWith(prefix)) {
-                entries.push({
-                  name: rootCID,
-                  cid: rootCID,
-                  size: size,
-                  isDir: false,
-                  modTime: upload.insertedAt || new Date().toISOString()
-                });
-              }
-            }
-          } else {
-            // No path specified - list all
-            entries.push({
-              name: rootCID,
-              cid: rootCID,
-              size: size,
-              isDir: false,
-              modTime: upload.insertedAt || new Date().toISOString()
-            });
-          }
-        }
-        
-        // Stop pagination if we found exact match
-        if (foundExactMatch) break;
-        
-        cursor = res.cursor;
-      } while (cursor);
+      // If path is empty, list all uploads at root level
+      if (!dirPath || dirPath === '' || dirPath === '/') {
+        return await handlers.listRootUploads();
+      }
       
-      return entries;
+      // Otherwise, treat path as CID or CID/subpath and list directory contents
+      return await handlers.listDirectory({ cid: dirPath });
     } catch (error) {
       console.error(`[storacha] List failed: ${error.message}`);
-      return [];
+      throw error;
     }
+  },
+
+  async listRootUploads() {
+    const entries = [];
+    
+    let cursor;
+    do {
+      const res = await client.capability.upload.list({ cursor });
+      if (!res || !res.results) break;
+      
+      for (const upload of res.results) {
+        const rootCID = upload.root.toString();
+        const size = upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0;
+        
+        entries.push({
+          name: rootCID,
+          cid: rootCID,
+          size: size,
+          isDir: false,
+          modTime: upload.insertedAt || new Date().toISOString()
+        });
+      }
+      
+      cursor = res.cursor;
+    } while (cursor);
+    
+    return entries;
+  },
+
+  async listDirectory({ cid }) {
+    console.error(`[storacha] listDirectory called with CID: "${cid}"`);
+    
+    // Parse path - could be just CID or CID/subpath
+    const parts = cid.split('/').filter(Boolean);
+    const rootCID = parts[0];
+    const subPath = parts.slice(1);
+    
+    console.error(`[storacha] Root CID: ${rootCID}, subPath: ${subPath.join('/')}`);
+    
+    // Fetch the root DAG node
+    let currentNode;
+    try {
+      currentNode = await handlers.fetchDag(rootCID);
+    } catch (error) {
+      console.error(`[storacha] Failed to fetch root CID: ${error.message}`);
+      throw new Error(`Directory not found: ${cid}`);
+    }
+    
+    // Walk the subpath if provided
+    for (const part of subPath) {
+      const link = currentNode.Links.find(l => l.Name === part);
+      if (!link) {
+        throw new Error(`Path not found: ${part} in ${cid}`);
+      }
+      currentNode = await handlers.fetchDag(link.Hash.toString());
+    }
+    
+    // Parse UnixFS data to check if it's a directory
+    let unixfs;
+    try {
+      unixfs = UnixFS.unmarshal(currentNode.Data);
+    } catch (error) {
+      console.error(`[storacha] Failed to parse UnixFS: ${error.message}`);
+      // If we can't parse UnixFS, but have links, treat as directory
+      if (currentNode.Links.length > 0) {
+        unixfs = { type: 'directory' };
+      } else {
+        throw new Error(`Not a directory: ${cid}`);
+      }
+    }
+    
+    if (unixfs.type !== 'directory') {
+      throw new Error(`Not a directory: ${cid}`);
+    }
+    
+    // List all links in the directory
+    const entries = [];
+    for (const link of currentNode.Links) {
+      const linkCID = link.Hash.toString();
+      
+      // Fetch child node to determine if it's a file or directory
+      let isDir = false;
+      let size = link.Tsize || 0;
+      
+      try {
+        const childNode = await handlers.fetchDag(linkCID);
+        const childUnixFS = UnixFS.unmarshal(childNode.Data);
+        isDir = childUnixFS.type === 'directory';
+        
+        // For files, get the actual data size (not Tsize which includes overhead)
+        if (!isDir && childUnixFS.data) {
+          size = childUnixFS.data.length;
+        }
+      } catch (error) {
+        console.error(`[storacha] Warning: could not fetch child node ${linkCID}: ${error.message}`);
+        // Assume it's a file if we can't determine
+        isDir = false;
+      }
+      
+      entries.push({
+        name: link.Name,
+        cid: linkCID,
+        size: size,
+        isDir: isDir,
+        modTime: new Date().toISOString() // DAG nodes don't have timestamps
+      });
+    }
+    
+    return entries;
   },
   
   async stat({ name }) {
     if (!client) throw new Error('Client not initialized');
     
-    // Use client.capability.upload.list() to find the file by CID
+    console.error(`[storacha] stat called with name: "${name}"`);
+    
     try {
-      let cursor;
-      do {
-        const res = await client.capability.upload.list({ cursor });
-        if (!res || !res.results) break;
-        
-        for (const upload of res.results) {
-          const rootCID = upload.root.toString();
-          if (rootCID === name) {
-            const size = upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0;
-            return {
-              found: true,
-              name: rootCID,
-              cid: rootCID,
-              size: size,
-              modTime: upload.insertedAt || new Date().toISOString()
-            };
-          }
-        }
-        
-        cursor = res.cursor;
-      } while (cursor);
+      // Parse path - could be just CID or CID/subpath
+      const parts = name.split('/').filter(Boolean);
+      const rootCID = parts[0];
+      const subPath = parts.slice(1);
       
-      return { found: false };
+      console.error(`[storacha] Root CID: ${rootCID}, subPath: ${subPath.join('/')}`);
+      
+      // First check if this root CID exists in uploads (for root-level files)
+      if (subPath.length === 0) {
+        const upload = await handlers.findUploadByCID(rootCID);
+        if (upload) {
+          return {
+            found: true,
+            name: rootCID,
+            cid: rootCID,
+            size: upload.size,
+            isDir: false,
+            modTime: upload.modTime
+          };
+        }
+      }
+      
+      // Try to fetch as DAG and traverse path
+      let currentNode;
+      let currentCID = rootCID;
+      
+      try {
+        currentNode = await handlers.fetchDag(rootCID);
+      } catch (error) {
+        console.error(`[storacha] Failed to fetch root CID: ${error.message}`);
+        return { found: false };
+      }
+      
+      // Walk the subpath
+      for (const part of subPath) {
+        const link = currentNode.Links.find(l => l.Name === part);
+        if (!link) {
+          console.error(`[storacha] Path part not found: ${part}`);
+          return { found: false };
+        }
+        currentCID = link.Hash.toString();
+        currentNode = await handlers.fetchDag(currentCID);
+      }
+      
+      // Parse UnixFS to determine type and size
+      let unixfs;
+      try {
+        unixfs = UnixFS.unmarshal(currentNode.Data);
+      } catch (error) {
+        console.error(`[storacha] Failed to parse UnixFS: ${error.message}`);
+        // If we can't parse but have links, assume directory
+        if (currentNode.Links.length > 0) {
+          return {
+            found: true,
+            name: name,
+            cid: currentCID,
+            size: 0,
+            isDir: true,
+            modTime: new Date().toISOString()
+          };
+        }
+        return { found: false };
+      }
+      
+      const isDir = unixfs.type === 'directory';
+      let size = 0;
+      
+      if (!isDir && unixfs.data) {
+        size = unixfs.data.length;
+      }
+      
+      return {
+        found: true,
+        name: name,
+        cid: currentCID,
+        size: size,
+        isDir: isDir,
+        modTime: new Date().toISOString()
+      };
+      
     } catch (error) {
       console.error(`[storacha] Stat failed: ${error.message}`);
       return { found: false };
     }
+  },
+
+  async findUploadByCID(cid) {
+    let cursor;
+    do {
+      const res = await client.capability.upload.list({ cursor });
+      if (!res || !res.results) break;
+      
+      for (const upload of res.results) {
+        const rootCID = upload.root.toString();
+        if (rootCID === cid) {
+          const size = upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0;
+          return {
+            cid: rootCID,
+            size: size,
+            modTime: upload.insertedAt || new Date().toISOString()
+          };
+        }
+      }
+      
+      cursor = res.cursor;
+    } while (cursor);
+    
+    return null;
   },
   
   async download({ cid }) {
@@ -510,6 +719,215 @@ export const handlers = {
     ];
     await client.capability.upload.add(newRootCID, allShards);
     console.error(`Registered new root ${newRootCID} with ${allShards.length} shards (${originalUpload.shards.length} original + 1 new)`);
+
+    // Check if old CID has a w3name - if so, create revision to update IPNS pointer
+    const oldCIDStr = cid.toString();
+    if (nameRegistry.has(oldCIDStr)) {
+      try {
+        const nameInfo = nameRegistry.get(oldCIDStr);
+        const nameInstance = await loadNameKey(nameInfo.keyFile);
+        
+        // Publish revision pointing new CID to the same IPNS name
+        const revision = await Name.v0(nameInstance, newRootCID);
+        await Name.publish(revision, nameInstance.key);
+        
+        // Update registry with new CID
+        nameRegistry.delete(oldCIDStr);
+        nameRegistry.set(newRootCID.toString(), {
+          name: nameInfo.name,
+          ipnsName: nameInfo.ipnsName,
+          keyFile: nameInfo.keyFile
+        });
+        
+        // Update key file to point to new CID
+        await saveNameKey(newRootCID.toString(), nameInstance);
+        
+        console.error(`[mkdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCID}`);
+      } catch (err) {
+        console.error(`[mkdir] Failed to update w3name revision: ${err.message}`);
+      }
+    } else {
+      console.error(`[mkdir] No w3name key found for old CID ${oldCIDStr}. IPNS pointer not updated.`);
+      console.error(`[mkdir] To enable IPNS updates, load the key file from ${W3NAME_DIR}`);
+    }
+
+    return { newRootCID: newRootCID.toString() };
+  },
+
+  /**
+   * Remove a named link from a dag-pb directory node.
+   * Throws if the link does not exist (so callers get a clear error).
+   *
+   * @param {dagPB.PBNode} node
+   * @param {string} linkName
+   * @returns {{ cid: CID, bytes: Buffer }}
+   */
+  async removeLinkFromNode(node, linkName) {
+    const originalCount = node.Links.length;
+    const links = node.Links.filter(l => l.Name !== linkName);
+
+    if (links.length === originalCount) {
+      throw new Error(`Entry "${linkName}" not found in directory node`);
+    }
+
+    // Links must remain sorted by name (dag-pb requirement)
+    links.sort((a, b) => (a.Name < b.Name ? -1 : a.Name > b.Name ? 1 : 0));
+
+    const rebuilt = dagPB.prepare({ Data: node.Data, Links: links });
+    const bytes   = dagPB.encode(rebuilt);
+    const hash    = await sha256.digest(bytes);
+    const cid     = CID.create(1, dagPB.code, hash);
+
+    return { cid, bytes: Buffer.from(bytes) };
+  },
+
+  /**
+   * Remove a directory (or file) entry from an existing uploaded DAG tree.
+   *
+   * Works identically to mkdir in structure:
+   *   1. Locate the upload record for the given root CID
+   *   2. Walk `path` to the parent node that contains `name`
+   *   3. Remove the link named `name` from that parent
+   *   4. Bubble the changed nodes back up to a new root
+   *   5. Upload a CAR of only the changed dag-pb nodes
+   *   6. Register new root = old shards + new shard
+   *
+   * @param {{ cid: string, path: string, name: string }} params
+   *   cid  — root CID of the existing upload
+   *   path — slash-separated path to the parent directory ('' or '/' = root)
+   *   name — name of the entry to remove from that parent
+   */
+  async rmdir({ cid, path, name }) {
+    if (!client) throw new Error('Client not initialized');
+    if (!currentSpace) throw new Error('No space selected');
+
+    // ── 1. Locate the original upload record ──────────────────────────────
+    const uploads = await client.capability.upload.list();
+    console.error(`[rmdir] Looking for root CID ${cid} among ${uploads.results.length} uploads...`);
+
+    const originalUpload = uploads.results.find(u => u.root.toString() === cid.toString());
+    if (!originalUpload) {
+      throw new Error(`Original upload with root ${cid} not found in your space.`);
+    }
+
+    // ── 2. Walk the path to the parent node that owns `name` ──────────────
+    const pathParts = (path === '' || path === '/')
+      ? []
+      : path.split('/').filter(Boolean);
+
+    const stack = []; // [{name, node}] breadcrumb trail from root down
+    let currentNode = await handlers.fetchDag(cid);
+
+    for (const part of pathParts) {
+      const link = currentNode.Links.find(l => l.Name === part);
+      if (!link) {
+        throw new Error(`[rmdir] Subdir "${part}" not found under current node`);
+      }
+      stack.push({ name: part, node: currentNode });
+      currentNode = await handlers.fetchDag(link.Hash.toString());
+    }
+
+    // ── 3. Remove the named entry from the target parent ──────────────────
+    let updated = await handlers.removeLinkFromNode(currentNode, name);
+
+    // Collect only the modified nodes (no new blocks — we're only removing)x
+    const blocksToWrite = [
+      { cid: updated.cid, bytes: updated.bytes }
+    ];
+
+    // ── 4. Bubble changes up the ancestor chain ───────────────────────────
+    while (stack.length > 0) {
+      const parent = stack.pop();
+      updated = await handlers.rebuildDirNode(parent.node, {
+        name: parent.name,
+        cid:  updated.cid,
+        size: updated.bytes.length
+      });
+      blocksToWrite.push({ cid: updated.cid, bytes: updated.bytes });
+    }
+
+    const newRootCID = updated.cid;
+    console.error(`[rmdir] New root CID: ${newRootCID}`);
+
+    // ── 5. Build and upload a CAR of only the changed dag-pb nodes ────────
+    const { writer, out } = await CarWriter.create([newRootCID]);
+    const chunks = [];
+
+    const readerPromise = (async () => {
+      for await (const chunk of out) chunks.push(chunk);
+    })();
+
+    for (const block of blocksToWrite) {
+      const cidObj = typeof block.cid === 'string' ? CID.parse(block.cid) : block.cid;
+      await writer.put({ cid: cidObj, bytes: block.bytes });
+    }
+
+    await writer.close();
+    await readerPromise;
+
+    const carBytes = Buffer.concat(chunks);
+    console.error(`[rmdir] Uploading CAR (${carBytes.length} bytes)...`);
+
+    const carBlob = new Blob([carBytes], { type: 'application/car' });
+    let newShardCID;
+
+    await client.uploadCAR(carBlob, {
+      rootCID: newRootCID,
+      onShardStored: meta => {
+        newShardCID = meta.cid;
+        console.error(`[rmdir] New shard CID: ${newShardCID}`);
+      }
+    });
+
+    if (!newShardCID) {
+      throw new Error('[rmdir] Failed to get shard CID from CAR upload');
+    }
+
+    // ── 6. Register the NEW root with OLD shards + NEW shard ──────────────
+    const normaliseCID = (s) => {
+      if (s && s.constructor?.name === 'CID') return s;
+      if (s && s.cid) return typeof s.cid === 'string' ? CID.parse(s.cid) : s.cid;
+      if (typeof s === 'string') return CID.parse(s);
+      return CID.parse(s.toString());
+    };
+
+    const allShards = [
+      ...originalUpload.shards.map(normaliseCID),
+      normaliseCID(newShardCID)
+    ];
+    await client.capability.upload.add(newRootCID, allShards);
+    console.error(`[rmdir] Registered new root ${newRootCID} with ${allShards.length} shards`);
+
+    // Check if old CID has a w3name - if so, create revision to update IPNS pointer
+    const oldCIDStr = cid.toString();
+    if (nameRegistry.has(oldCIDStr)) {
+      try {
+        const nameInfo = nameRegistry.get(oldCIDStr);
+        const nameInstance = await loadNameKey(nameInfo.keyFile);
+        
+        // Publish revision pointing new CID to the same IPNS name
+        const revision = await Name.v0(nameInstance, newRootCID);
+        await Name.publish(revision, nameInstance.key);
+        
+        // Update registry with new CID
+        nameRegistry.delete(oldCIDStr);
+        nameRegistry.set(newRootCID.toString(), {
+          name: nameInfo.name,
+          ipnsName: nameInfo.ipnsName,
+          keyFile: nameInfo.keyFile
+        });
+        
+        // Update key file to point to new CID
+        await saveNameKey(newRootCID.toString(), nameInstance);
+        
+        console.error(`[rmdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCID}`);
+      } catch (err) {
+        console.error(`[rmdir] Failed to update w3name revision: ${err.message}`);
+      }
+    } else {
+      console.error(`[rmdir] No w3name key found for old CID ${oldCIDStr}. IPNS pointer not updated.`);
+      console.error(`[rmdir] To enable IPNS updates, load the key file from ${W3NAME_DIR}`);
+    }
 
     return { newRootCID: newRootCID.toString() };
   },
